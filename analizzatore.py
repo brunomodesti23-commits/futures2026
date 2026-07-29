@@ -3,203 +3,193 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import timedelta
 
 # =====================================================================
-# CONFIGURAZIONE INIZIALE - SIGNAL MACHINE
+# CONFIGURAZIONE INIZIALE (Stile Formi.life)
 # =====================================================================
-st.set_page_config(page_title="Trading Hub - Black Box", page_icon="🎯", layout="wide")
-st.title("🎯 Black Box: Segnali Istituzionali Automatici")
-st.markdown("*Niente impostazioni. Solo matematica, liquidità e livelli operativi precisi.*")
+st.set_page_config(page_title="Trading Hub - Prop Firm Edition", page_icon="🐜", layout="wide")
+st.title("🐜 Hub Intraday: Prop Firm Challenge Edition")
+st.markdown("*L'efficienza del cecchino: Entrate precise, Stop stretti, Nessun Overnight.*")
 
 # =====================================================================
-# PARAMETRI ISTITUZIONALI HARDCODATI (Il segreto dell'algoritmo)
+# WATCHLIST ESCLUSIVA DAY TRADING
 # =====================================================================
-# Questi sono i parametri ottimali fissati dal Pro Trader, inaccessibili all'utente.
-VOL_LENGTH = 20          # Periodi per la media dei volumi
-VOL_MULT = 1.5           # Moltiplicatore per identificare l'ingresso istituzionale
-LOOKBACK_SWEEP = 10      # Candele per la caccia agli stop
-RR_RATIO = 2.0           # Rapporto Rischio Rendimento blindato a 1:2
-
 watchlists = {
-    "🎯 Futures (Seleziona per i Segnali)": ["NQ=F", "ES=F", "RTY=F", "CL=F", "GC=F"]
+    "🎯 Micro/Mini Futures": [
+        "NQ=F",   # Nasdaq 100
+        "ES=F",   # S&P 500
+        "RTY=F",  # Russell 2000 
+        "CL=F",   # Petrolio
+        "GC=F"    # Oro
+    ]
 }
 
 # =====================================================================
-# MOTORE DI CALCOLO E ALGORITMO SMC
+# MOTORE DI CALCOLO ROBUSTO (FVG + VWAP + VOLUMI)
 # =====================================================================
-@st.cache_data(ttl=60) # Si aggiorna ogni minuto
-def carica_e_calcola(ticker):
+@st.cache_data(ttl=60)
+def carica_e_calcola_smart_money(ticker):
     try:
         titolo = yf.Ticker(ticker)
+        # Scarichiamo gli ultimi 5 giorni a 15 minuti per avere storico solido
         dati = titolo.history(period="5d", interval="15m")
-        if dati.empty: return None
+        if dati is None or len(dati) < 30:
+            return None
+        
         dati = dati.dropna().copy()
         
-        # ATR Intraday per i Buffer degli Stop Loss
+        # 1. Volumi e Media Mobile dei Volumi
+        vol_length = 20
+        vol_mult = 1.5
+        dati['Avg_Vol'] = dati['Volume'].rolling(window=vol_length).mean()
+        dati['High_Volume'] = dati['Volume'] > (dati['Avg_Vol'] * vol_mult)
+        
+        # 2. Fair Value Gaps (FVG)
+        dati['FVG_Bull'] = (dati['Low'] > dati['High'].shift(2)) & (dati['Close'].shift(1) > dati['Open'].shift(1))
+        dati['FVG_Bear'] = (dati['High'] < dati['Low'].shift(2)) & (dati['Close'].shift(1) < dati['Open'].shift(1))
+        
+        # 3. ATR Intraday per Stop Loss dinamico
         dati['TR'] = np.maximum(dati['High'] - dati['Low'], 
                      np.maximum(abs(dati['High'] - dati['Close'].shift(1)), 
                                 abs(dati['Low'] - dati['Close'].shift(1))))
-        dati['ATR_15m'] = dati['TR'].rolling(window=14).mean()
+        dati['ATR'] = dati['TR'].rolling(window=14).mean()
         
-        # Volumi e VWAP
-        dati['Volume_Medio'] = dati['Volume'].rolling(window=VOL_LENGTH).mean()
+        # 4. VWAP Giornaliero
         dati['Data'] = dati.index.date
         dati['Prezzo_Tipico'] = (dati['High'] + dati['Low'] + dati['Close']) / 3
-        dati['Cum_Volume'] = dati.groupby('Data')['Volume'].cumsum()
-        dati['Cum_VP'] = dati.groupby('Data')['Volume_x_Prezzo'] = dati['Prezzo_Tipico'] * dati['Volume']
-        dati['Cum_VP'] = dati.groupby('Data')['Volume_x_Prezzo'].cumsum()
-        dati['VWAP'] = dati['Cum_VP'] / dati['Cum_Volume']
+        dati['VP'] = dati['Prezzo_Tipico'] * dati['Volume']
+        dati['Cum_Vol'] = dati.groupby('Data')['Volume'].cumsum()
+        dati['Cum_VP'] = dati.groupby('Data')['VP'].cumsum()
+        dati['VWAP'] = dati['Cum_VP'] / dati['Cum_Vol']
+        
+        # 5. Breakout Operativo (Incrocio VWAP con Volumi - Setup d'assalto)
+        dati['VWAP_Cross_Bull'] = (dati['Close'] > dati['VWAP']) & (dati['Close'].shift(1) < dati['VWAP'].shift(1)) & dati['High_Volume']
+        dati['VWAP_Cross_Bear'] = (dati['Close'] < dati['VWAP']) & (dati['Close'].shift(1) > dati['VWAP'].shift(1)) & dati['High_Volume']
         
         return dati.dropna()
-    except:
+    except Exception as e:
         return None
 
-def calcola_fvg_smc(df):
-    zones = []
-    for i in range(max(3, LOOKBACK_SWEEP + 2), len(df)):
-        curr, prev1, prev2 = df.iloc[i], df.iloc[i-1], df.iloc[i-2]
-        
-        # 1. Gestione Inversion (se rompe la zona)
-        for z in zones:
-            if z['status'] == 'active':
-                z['end_idx'] = df.index[i]
-                if z['type'] == 'bull' and curr['Close'] < z['bottom'] and prev1['Close'] >= z['bottom']:
-                    z['status'] = 'inverted_short'
-                elif z['type'] == 'bear' and curr['Close'] > z['top'] and prev1['Close'] <= z['top']:
-                    z['status'] = 'inverted_long'
-
-        # 2. Pattern SMC + Filtro Sweep + Filtro Volumi
-        is_high_volume = prev1['Volume'] > (prev1['Volume_Medio'] * VOL_MULT)
-        
-        fvg_bull = curr['Low'] > prev2['High'] and prev1['Close'] > prev1['Open']
-        fvg_bear = curr['High'] < prev2['Low'] and prev1['Close'] < prev1['Open']
-        
-        # Caccia alla liquidità obbligatoria
-        lowest_past = df['Low'].iloc[i-2-LOOKBACK_SWEEP : i-2].min()
-        highest_past = df['High'].iloc[i-2-LOOKBACK_SWEEP : i-2].max()
-        
-        valid_bull = fvg_bull and is_high_volume and (prev2['Low'] < lowest_past)
-        valid_bear = fvg_bear and is_high_volume and (prev2['High'] > highest_past)
-        
-        if valid_bull:
-            zones.append({'type': 'bull', 'status': 'active', 'start_idx': df.index[i-2], 'end_idx': df.index[i], 'top': curr['Low'], 'bottom': prev2['High']})
-        if valid_bear:
-            zones.append({'type': 'bear', 'status': 'active', 'start_idx': df.index[i-2], 'end_idx': df.index[i], 'top': prev2['Low'], 'bottom': curr['High']})
-            
-    for z in zones:
-        if z['status'] == 'active' or z['status'].startswith('inverted'):
-            z['end_idx'] = df.index[-1] + timedelta(minutes=45) 
-            
-    return zones
-
-def trova_segnale_automatico(prezzo, vwap, atr, zone_attive):
-    for z in reversed(zone_attive):  
-        if z['bottom'] <= prezzo <= z['top']:
-            buffer = atr * 0.5 # Aggiunge un po' di respiro allo stop loss basato sull'ATR
-            
-            # SEGNALE LONG
-            if (z['status'] == 'active' and z['type'] == 'bull') or z['status'] == 'inverted_long':
-                # Regola d'oro: Compriamo solo se siamo SOPRA o VICINISSIMI al VWAP
-                if prezzo >= (vwap - atr): 
-                    sl = z['bottom'] - buffer
-                    tp = prezzo + ((prezzo - sl) * RR_RATIO)
-                    return {"azione": "COMPRA AL MERCATO (LONG) 🟢", "colore": "#00C851", "entry": prezzo, "sl": sl, "tp": tp, "zona": z}
-                    
-            # SEGNALE SHORT
-            elif (z['status'] == 'active' and z['type'] == 'bear') or z['status'] == 'inverted_short':
-                # Regola d'oro: Vendiamo solo se siamo SOTTO o VICINISSIMI al VWAP
-                if prezzo <= (vwap + atr):
-                    sl = z['top'] + buffer
-                    tp = prezzo - ((sl - prezzo) * RR_RATIO)
-                    return {"azione": "VENDI AL MERCATO (SHORT) 🔴", "colore": "#ff4444", "entry": prezzo, "sl": sl, "tp": tp, "zona": z}
-    return None
-
 # =====================================================================
-# CRUSCOTTO OPERATIVO (UI PULITA E DIRETTA)
+# INTERFACCIA UTENTE (SIDEBAR & HUD)
 # =====================================================================
-asset_selezionato = st.selectbox("Seleziona il Mercato:", watchlists["🎯 Futures (Seleziona per i Segnali)"])
-dati = carica_e_calcola(asset_selezionato)
+st.sidebar.header("⚙️ Configurazione Cecchino")
+asset_selezionato = st.sidebar.selectbox("Seleziona Asset:", watchlists["🎯 Micro/Mini Futures"])
 
-if dati is not None:
-    ultimo_prezzo = dati.iloc[-1]['Close']
-    ultimo_vwap = dati.iloc[-1]['VWAP']
-    ultimo_atr = dati.iloc[-1]['ATR_15m']
-    zone_fvg = calcola_fvg_smc(dati)
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Regole di Gestione")
+st.sidebar.markdown("- **Rischio/Rendimento:** 1 : 2")
+st.sidebar.markdown("- **Filtro Volumi:** 1.5x la media")
+st.sidebar.markdown("- **Orario Operativo:** 15:30 - 21:30 (NY Session)")
+
+st.warning("⚠️ **REGOLA D'ORO PROP FIRM:** Chiudi TUTTE le posizioni prima delle 22:00. Zero overnight!")
+
+# Caricamento dati
+dati = carica_e_calcola_smart_money(asset_selezionato)
+
+if dati is not None and not dati.empty:
+    ultimo = dati.iloc[-1]
+    prezzo_corrente = ultimo['Close']
+    vwap_val = ultimo['VWAP']
+    atr_val = ultimo['ATR']
     
-    segnale = trova_segnale_automatico(ultimo_prezzo, ultimo_vwap, ultimo_atr, zone_fvg)
+    # Controllo delle ultime 3 candele per segnali freschi
+    ultime_3 = dati.tail(3)
     
-    # 1. PANNELLO SEGNALI (ENORME)
-    if segnale:
+    # Setup 1: FVG (Cecchino - Raro ma letale)
+    fvg_long = ultime_3['FVG_Bull'].any() and (prezzo_corrente > vwap_val)
+    fvg_short = ultime_3['FVG_Bear'].any() and (prezzo_corrente < vwap_val)
+    
+    # Setup 2: VWAP Breakout (Assalto in apertura - Più frequente)
+    vwap_cross_long = ultime_3['VWAP_Cross_Bull'].any()
+    vwap_cross_short = ultime_3['VWAP_Cross_Bear'].any()
+    
+    segnale_long = fvg_long or vwap_cross_long
+    segnale_short = fvg_short or vwap_cross_short
+    
+    tipo_setup = ""
+    if fvg_long or fvg_short:
+        tipo_setup = "CECCHINO (FVG)"
+    elif vwap_cross_long or vwap_cross_short:
+        tipo_setup = "ASSALTO (Breakout Volumi)"
+    
+    # Cruscotto HUD (Head-Up Display)
+    col_hud1, col_hud2, col_hud3 = st.columns(3)
+    
+    with col_hud1:
+        st.metric(label="Prezzo Attuale", value=f"{prezzo_corrente:.2f}")
+    with col_hud2:
+        st.metric(label="VWAP Istituzionale", value=f"{vwap_val:.2f}")
+    with col_hud3:
+        if segnale_long:
+            st.success(f"🟢 STATO: SEGNALE LONG [{tipo_setup}]")
+        elif segnale_short:
+            st.error(f"🔴 STATO: SEGNALE SHORT [{tipo_setup}]")
+        else:
+            st.info("⚪ STATO: MANI IN TASCA (Attendi)")
+
+    # Dettagli operativi se c'è un segnale
+    if segnale_long:
+        entry = prezzo_corrente
+        sl = entry - (atr_val * 1.0)
+        tp = entry + (atr_val * 2.0)
         st.markdown(f"""
-        <div style="background-color: {segnale['colore']}20; border: 2px solid {segnale['colore']}; padding: 20px; border-radius: 10px; text-align: center;">
-            <h1 style="color: {segnale['colore']}; margin: 0; font-size: 40px;">{segnale['azione']}</h1>
-            <p style="font-size: 20px; margin-top: 10px;">Le condizioni istituzionali (VWAP + FVG) sono allineate in questo preciso istante.</p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        c1, c2, c3 = st.columns(3)
-        c1.metric("1️⃣ INGRESSO", f"{segnale['entry']:.2f}")
-        c2.metric("2️⃣ STOP LOSS (Imprescindibile)", f"{segnale['sl']:.2f}")
-        c3.metric("3️⃣ TAKE PROFIT (Risk 1:2)", f"{segnale['tp']:.2f}")
+        ### 🎯 Piano Operativo LONG
+        - **Ingresso Consigliato:** `{entry:.2f}`
+        - **Stop Loss (Rischio):** `{sl:.2f}` (Distanza: `{entry - sl:.2f} pt`)
+        - **Take Profit (Target):** `{tp:.2f}` (Distanza: `{tp - entry:.2f} pt`)
+        """)
+    elif segnale_short:
+        entry = prezzo_corrente
+        sl = entry + (atr_val * 1.0)
+        tp = entry - (atr_val * 2.0)
+        st.markdown(f"""
+        ### 🎯 Piano Operativo SHORT
+        - **Ingresso Consigliato:** `{entry:.2f}`
+        - **Stop Loss (Rischio):** `{sl:.2f}` (Distanza: `{sl - entry:.2f} pt`)
+        - **Take Profit (Target):** `{tp:.2f}` (Distanza: `{entry - tp:.2f} pt`)
+        """)
     else:
-        st.markdown("""
-        <div style="background-color: #333333; border: 2px solid #555555; padding: 20px; border-radius: 10px; text-align: center;">
-            <h1 style="color: #ffffff; margin: 0; font-size: 40px;">⚪ MANI IN TASCA (NESSUN SEGNALE)</h1>
-            <p style="font-size: 20px; margin-top: 10px; color: #aaaaaa;">Il prezzo sta facendo rumore. Attendiamo che cada nella nostra trappola di liquidità.</p>
-        </div>
-        """, unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Prezzo Attuale", f"{ultimo_prezzo:.2f}")
-        c2.metric("VWAP (Bussola)", f"{ultimo_vwap:.2f}")
-        c3.metric("Volatilità (ATR)", f"{ultimo_atr:.2f} pt")
+        st.markdown("---")
+        st.markdown("### 🧘‍♂️ Zona di Attesa")
+        st.markdown("Il mercato sta oscillando senza toccare le zone istituzionali con volumi anomali. **Nessuna operazione da fare.** Proteggere il capitale è il primo guadagno.")
 
-    # 2. GRAFICO (Semplice, ti mostra solo il contesto)
-    st.markdown("---")
-    st.markdown(f"### Mappa del Campo di Battaglia ({asset_selezionato})")
+    # Grafico Principale Pulito
+    st.markdown(f"### 📊 Grafico Operativo 15m - {asset_selezionato}")
     
-    ultimi_giorni = dati.tail(70) 
+    # Mostriamo le ultime 80 candele per massima nitidezza
+    grafico_dati = dati.tail(80)
+    
     fig = go.Figure()
     
+    # Candele
     fig.add_trace(go.Candlestick(
-        x=ultimi_giorni.index, open=ultimi_giorni['Open'], high=ultimi_giorni['High'], 
-        low=ultimi_giorni['Low'], close=ultimi_giorni['Close'], name='Prezzo'
+        x=grafico_dati.index,
+        open=grafico_dati['Open'],
+        high=grafico_dati['High'],
+        low=grafico_dati['Low'],
+        close=grafico_dati['Close'],
+        name='Prezzo 15m'
     ))
     
+    # VWAP (Linea Oro Istituzionale)
     fig.add_trace(go.Scatter(
-        x=ultimi_giorni.index, y=ultimi_giorni['VWAP'], 
-        mode='lines', name='VWAP', line=dict(color='white', width=2, dash='dot')
+        x=grafico_dati.index,
+        y=grafico_dati['VWAP'],
+        mode='lines',
+        name='VWAP',
+        line=dict(color='#d4af37', width=2.5)
     ))
     
-    for z in zone_fvg:
-        if z['end_idx'] >= ultimi_giorni.index[0]: 
-            if z['status'] == 'active' and z['type'] == 'bull':
-                fill_c, line_c = 'rgba(0, 255, 0, 0.15)', 'lime'
-            elif z['status'] == 'active' and z['type'] == 'bear':
-                fill_c, line_c = 'rgba(255, 0, 0, 0.15)', 'red'
-            elif z['status'] == 'inverted_short':
-                fill_c, line_c = 'rgba(255, 165, 0, 0.15)', 'orange'
-            elif z['status'] == 'inverted_long':
-                fill_c, line_c = 'rgba(0, 191, 255, 0.15)', 'deepskyblue'
-            else:
-                continue
-            
-            fig.add_shape(type="rect",
-                x0=z['start_idx'], y0=z['bottom'], x1=z['end_idx'], y1=z['top'],
-                line=dict(color=line_c, width=1), fillcolor=fill_c, layer="below"
-            )
-
-    if segnale:
-        fig.add_hline(y=segnale['entry'], line_color="white", annotation_text="ENTRATA")
-        fig.add_hline(y=segnale['sl'], line_dash="dot", line_color="red", annotation_text="STOP LOSS")
-        fig.add_hline(y=segnale['tp'], line_dash="dot", line_color="green", annotation_text="TAKE PROFIT")
-
     fig.update_layout(
-        xaxis_rangeslider_visible=False, template="plotly_dark", height=600, 
-        margin=dict(l=10, r=60, t=10, b=10), yaxis=dict(side="right", tickformat=".2f"), showlegend=False
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        height=550,
+        margin=dict(l=10, r=60, t=10, b=10),
+        yaxis=dict(side="right", tickformat=".2f")
     )
-    st.plotly_chart(fig, use_container_width=True)
     
-    st.caption("Nota: I dati Yahoo Finance gratuiti possono avere fino a 15 min di ritardo. Usare questo algoritmo su un conto Prop in Live richiede un flusso dati in tempo reale (es. NinjaTrader/Tradovate) per eseguire l'ordine effettivo.")
+    st.plotly_chart(fig, use_container_width=True)
+
 else:
-    st.error("Dati in caricamento o mercati chiusi.")
+    st.error("⏳ **Caricamento dati in corso o mercato in pausa:** Yahoo Finance sta elaborando i flussi. Ricarica la pagina tra qualche istante.")
